@@ -33,6 +33,10 @@ export const useWebRTC = (
   const localStream = ref<MediaStream | null>(null);
   const remoteStreams = ref<Map<string, RemoteStream>>(new Map());
   const connections = ref<Map<string, RTCPeerConnection>>(new Map());
+  // Буфер для ICE кандидатов, которые приходят до создания соединения
+  const pendingIceCandidates = ref<Map<string, WebRTCIceCandidate[]>>(
+    new Map()
+  );
   // Начальное состояние false, пока не получим реальный поток
   const audioEnabled = ref(false);
   const videoEnabled = ref(false);
@@ -313,13 +317,72 @@ export const useWebRTC = (
       console.log("[WebRTC] Получен удаленный трек от", targetPeerId);
       const stream = event.streams[0];
       if (stream) {
+        // Проверяем реальное состояние треков
+        const audioTracks = stream.getAudioTracks();
+        const videoTracks = stream.getVideoTracks();
+        const audioEnabled =
+          audioTracks.length > 0 && audioTracks.some((t) => t.enabled);
+        const videoEnabled =
+          videoTracks.length > 0 && videoTracks.some((t) => t.enabled);
+
         const remoteStream: RemoteStream = {
           peerId: targetPeerId,
           stream,
-          audioEnabled: true,
-          videoEnabled: true,
+          audioEnabled,
+          videoEnabled,
         };
         remoteStreams.value.set(targetPeerId, remoteStream);
+
+        // Отслеживаем изменения состояния треков
+        audioTracks.forEach((track) => {
+          track.onended = () => {
+            const rs = remoteStreams.value.get(targetPeerId);
+            if (rs) {
+              rs.audioEnabled = false;
+            }
+          };
+          track.onmute = () => {
+            const rs = remoteStreams.value.get(targetPeerId);
+            if (rs) {
+              rs.audioEnabled = false;
+            }
+          };
+          track.onunmute = () => {
+            const rs = remoteStreams.value.get(targetPeerId);
+            if (rs) {
+              rs.audioEnabled = true;
+            }
+          };
+        });
+
+        videoTracks.forEach((track) => {
+          track.onended = () => {
+            const rs = remoteStreams.value.get(targetPeerId);
+            if (rs) {
+              rs.videoEnabled = false;
+            }
+          };
+          track.onmute = () => {
+            const rs = remoteStreams.value.get(targetPeerId);
+            if (rs) {
+              rs.videoEnabled = false;
+            }
+          };
+          track.onunmute = () => {
+            const rs = remoteStreams.value.get(targetPeerId);
+            if (rs) {
+              rs.videoEnabled = true;
+            }
+          };
+        });
+
+        console.log("[WebRTC] Удаленный поток добавлен:", {
+          peerId: targetPeerId,
+          audioTracks: audioTracks.length,
+          videoTracks: videoTracks.length,
+          audioEnabled,
+          videoEnabled,
+        });
       }
     };
 
@@ -390,11 +453,20 @@ export const useWebRTC = (
   ) => {
     let peerConnection = connections.value.get(senderPeerId);
 
-    if (!peerConnection) {
-      peerConnection = createPeerConnection(senderPeerId);
+    // Если соединение уже существует, закрываем его и создаем новое
+    if (peerConnection) {
+      console.warn(
+        `[WebRTC] Соединение с ${senderPeerId} уже существует, закрываем и создаем новое`
+      );
+      peerConnection.close();
+      connections.value.delete(senderPeerId);
+      remoteStreams.value.delete(senderPeerId);
     }
 
+    peerConnection = createPeerConnection(senderPeerId);
+
     try {
+      // Устанавливаем remote description
       await peerConnection.setRemoteDescription(
         new RTCSessionDescription(offer)
       );
@@ -409,6 +481,34 @@ export const useWebRTC = (
         sdp: answer.sdp || "",
       };
       sendWebRTCAnswer(webRTCAnswer, senderPeerId, roomId);
+
+      console.log(`[WebRTC] Answer создан и отправлен для ${senderPeerId}`);
+
+      // Обрабатываем отложенные ICE кандидаты после установки local description
+      const pendingCandidates = pendingIceCandidates.value.get(senderPeerId);
+      if (pendingCandidates && pendingCandidates.length > 0) {
+        console.log(
+          `[WebRTC] Обрабатываем ${pendingCandidates.length} отложенных ICE кандидатов для ${senderPeerId}`
+        );
+        for (const candidate of pendingCandidates) {
+          try {
+            await peerConnection.addIceCandidate(
+              new RTCIceCandidate({
+                candidate: candidate.candidate,
+                sdpMLineIndex: candidate.sdpMLineIndex,
+                sdpMid: candidate.sdpMid,
+                usernameFragment: candidate.usernameFragment || undefined,
+              })
+            );
+          } catch (candidateError) {
+            console.warn(
+              `[WebRTC] Ошибка добавления отложенного ICE кандидата:`,
+              candidateError
+            );
+          }
+        }
+        pendingIceCandidates.value.delete(senderPeerId);
+      }
     } catch (error) {
       console.error(
         `[WebRTC] Ошибка обработки offer от ${senderPeerId}:`,
@@ -433,15 +533,62 @@ export const useWebRTC = (
     }
 
     try {
-      await peerConnection.setRemoteDescription(
-        new RTCSessionDescription(answer)
+      // Проверяем состояние соединения перед установкой remote description
+      const currentState = peerConnection.signalingState;
+      console.log(
+        `[WebRTC] Текущее состояние соединения с ${senderPeerId}:`,
+        currentState
       );
+
+      // Answer можно установить только если мы в состоянии "have-local-offer"
+      if (currentState === "have-local-offer") {
+        await peerConnection.setRemoteDescription(
+          new RTCSessionDescription(answer)
+        );
+        console.log(`[WebRTC] Answer успешно установлен для ${senderPeerId}`);
+
+        // Обрабатываем отложенные ICE кандидаты
+        const pendingCandidates = pendingIceCandidates.value.get(senderPeerId);
+        if (pendingCandidates && pendingCandidates.length > 0) {
+          console.log(
+            `[WebRTC] Обрабатываем ${pendingCandidates.length} отложенных ICE кандидатов для ${senderPeerId}`
+          );
+          for (const candidate of pendingCandidates) {
+            try {
+              await peerConnection.addIceCandidate(
+                new RTCIceCandidate({
+                  candidate: candidate.candidate,
+                  sdpMLineIndex: candidate.sdpMLineIndex,
+                  sdpMid: candidate.sdpMid,
+                  usernameFragment: candidate.usernameFragment || undefined,
+                })
+              );
+            } catch (candidateError) {
+              console.warn(
+                `[WebRTC] Ошибка добавления отложенного ICE кандидата:`,
+                candidateError
+              );
+            }
+          }
+          pendingIceCandidates.value.delete(senderPeerId);
+        }
+      } else if (currentState === "stable") {
+        // Если соединение уже в stable, значит answer уже был установлен
+        // Это может быть нормально, если answer пришел дважды
+        console.warn(
+          `[WebRTC] Попытка установить answer в состоянии "stable" для ${senderPeerId}. Возможно, answer уже был установлен.`
+        );
+      } else {
+        console.error(
+          `[WebRTC] Невозможно установить answer в состоянии "${currentState}" для ${senderPeerId}`
+        );
+      }
     } catch (error) {
       console.error(
         `[WebRTC] Ошибка обработки answer от ${senderPeerId}:`,
         error
       );
-      closePeerConnection(senderPeerId);
+      // Не закрываем соединение при ошибке, так как это может быть временная проблема
     }
   };
 
@@ -453,26 +600,55 @@ export const useWebRTC = (
     const peerConnection = connections.value.get(senderPeerId);
 
     if (!peerConnection) {
-      console.warn(
-        `[WebRTC] Соединение с ${senderPeerId} не найдено для ICE candidate`
+      // Если соединение еще не создано, сохраняем кандидата в буфер
+      console.log(
+        `[WebRTC] Соединение с ${senderPeerId} еще не создано, сохраняем ICE candidate в буфер`
       );
+      if (!pendingIceCandidates.value.has(senderPeerId)) {
+        pendingIceCandidates.value.set(senderPeerId, []);
+      }
+      pendingIceCandidates.value.get(senderPeerId)!.push(candidate);
       return;
     }
 
     try {
-      await peerConnection.addIceCandidate(
-        new RTCIceCandidate({
-          candidate: candidate.candidate,
-          sdpMLineIndex: candidate.sdpMLineIndex,
-          sdpMid: candidate.sdpMid,
-          usernameFragment: candidate.usernameFragment || undefined,
-        })
-      );
+      // Проверяем состояние соединения
+      const currentState = peerConnection.signalingState;
+
+      // ICE кандидаты можно добавлять только если remote description установлен
+      // или если мы в процессе установки (не в "stable" без remote description)
+      if (
+        currentState === "have-local-offer" ||
+        currentState === "have-remote-offer" ||
+        currentState === "stable"
+      ) {
+        await peerConnection.addIceCandidate(
+          new RTCIceCandidate({
+            candidate: candidate.candidate,
+            sdpMLineIndex: candidate.sdpMLineIndex,
+            sdpMid: candidate.sdpMid,
+            usernameFragment: candidate.usernameFragment || undefined,
+          })
+        );
+        console.log(
+          `[WebRTC] ICE candidate успешно добавлен для ${senderPeerId}`
+        );
+      } else {
+        // Сохраняем в буфер, если соединение еще не готово
+        console.log(
+          `[WebRTC] Соединение с ${senderPeerId} не готово (${currentState}), сохраняем ICE candidate в буфер`
+        );
+        if (!pendingIceCandidates.value.has(senderPeerId)) {
+          pendingIceCandidates.value.set(senderPeerId, []);
+        }
+        pendingIceCandidates.value.get(senderPeerId)!.push(candidate);
+      }
     } catch (error) {
       console.error(
         `[WebRTC] Ошибка добавления ICE candidate от ${senderPeerId}:`,
         error
       );
+      // Не критично, продолжаем работу
     }
   };
 
@@ -484,6 +660,8 @@ export const useWebRTC = (
       connections.value.delete(targetPeerId);
     }
     remoteStreams.value.delete(targetPeerId);
+    // Очищаем буфер отложенных ICE кандидатов
+    pendingIceCandidates.value.delete(targetPeerId);
   };
 
   // Переключение аудио
@@ -568,6 +746,8 @@ export const useWebRTC = (
     });
     connections.value.clear();
     remoteStreams.value.clear();
+    // Очищаем все буферы отложенных ICE кандидатов
+    pendingIceCandidates.value.clear();
   };
 
   // Остановка локального потока

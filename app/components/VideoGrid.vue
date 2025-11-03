@@ -449,6 +449,10 @@ watch(
   () => props.remoteStreams,
   async (streams) => {
     await nextTick();
+    if (!streams || !(streams instanceof Map)) {
+      console.warn("[VideoGrid] remoteStreams не является Map или undefined");
+      return;
+    }
     streams.forEach((remoteStream, peerId) => {
       const videoElement = remoteVideoRefs.value.get(peerId);
       if (videoElement && remoteStream.stream) {
@@ -490,21 +494,23 @@ onMounted(async () => {
   }
 
   // Также привязываем удаленные потоки
-  props.remoteStreams.forEach((remoteStream, peerId) => {
-    const videoElement = remoteVideoRefs.value.get(peerId);
-    if (videoElement && remoteStream.stream) {
-      const videoTracks = remoteStream.stream.getVideoTracks();
-      if (videoTracks.length > 0) {
-        videoElement.srcObject = remoteStream.stream;
-        videoElement.play().catch((err) => {
-          console.error(
-            `[VideoGrid] Ошибка воспроизведения видео от ${peerId} в onMounted:`,
-            err
-          );
-        });
+  if (props.remoteStreams && props.remoteStreams instanceof Map) {
+    props.remoteStreams.forEach((remoteStream, peerId) => {
+      const videoElement = remoteVideoRefs.value.get(peerId);
+      if (videoElement && remoteStream.stream) {
+        const videoTracks = remoteStream.stream.getVideoTracks();
+        if (videoTracks.length > 0) {
+          videoElement.srcObject = remoteStream.stream;
+          videoElement.play().catch((err) => {
+            console.error(
+              `[VideoGrid] Ошибка воспроизведения видео от ${peerId} в onMounted:`,
+              err
+            );
+          });
+        }
       }
-    }
-  });
+    });
+  }
 });
 
 onUnmounted(() => {

@@ -246,8 +246,13 @@ watch(
   () => webrtc.value?.remoteStreams,
   (streamsRef) => {
     const streams = streamsRef ? (streamsRef as any).value : new Map();
-    remoteStreams.value = streams;
-    console.log("[App] remoteStreams обновлен, количество:", streams.size);
+    if (streams && streams instanceof Map) {
+      remoteStreams.value = streams;
+      console.log("[App] remoteStreams обновлен, количество:", streams.size);
+    } else {
+      remoteStreams.value = new Map();
+      console.log("[App] remoteStreams сброшен (невалидные данные)");
+    }
   },
   { immediate: true, deep: true }
 );
