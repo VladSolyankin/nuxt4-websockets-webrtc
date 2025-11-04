@@ -206,6 +206,19 @@ const remoteVideoRefs = ref<Map<string, HTMLVideoElement>>(new Map());
 // Принудительный триггер для обновления computed при изменении props
 const trackUpdateTrigger = ref(0);
 
+// Computed для отслеживания изменений в remoteStreams Map
+// Это помогает Vue отслеживать изменения в Map
+const remoteStreamsArray = computed(() => {
+  if (!props.remoteStreams || !(props.remoteStreams instanceof Map)) {
+    return [];
+  }
+  // Преобразуем Map в массив для лучшей реактивности
+  return Array.from(props.remoteStreams.entries()).map(([peerId, stream]) => ({
+    peerId,
+    stream,
+  }));
+});
+
 const totalParticipants = computed(() => {
   return props.participants.length + 1;
 });
@@ -445,6 +458,100 @@ watch(
 );
 
 // Привязка удаленных потоков к видео элементам
+// Используем отдельную функцию для установки потока с retry механизмом
+const setRemoteStream = async (peerId: string, remoteStream: RemoteStream) => {
+  await nextTick();
+  
+  const videoElement = remoteVideoRefs.value.get(peerId);
+  if (!videoElement) {
+    console.log(`[VideoGrid] Видео элемент для ${peerId} еще не готов`);
+    return;
+  }
+
+  if (!remoteStream.stream) {
+    console.warn(`[VideoGrid] Поток отсутствует для ${peerId}`);
+    return;
+  }
+
+  const videoTracks = remoteStream.stream.getVideoTracks();
+  const audioTracks = remoteStream.stream.getAudioTracks();
+  
+  console.log(`[VideoGrid] Установка удаленного потока для ${peerId}:`, {
+    videoTracks: videoTracks.length,
+    audioTracks: audioTracks.length,
+    videoEnabled: remoteStream.videoEnabled,
+    audioEnabled: remoteStream.audioEnabled,
+    streamId: remoteStream.stream.id,
+    currentSrcObject: videoElement.srcObject instanceof MediaStream 
+      ? (videoElement.srcObject as MediaStream).id 
+      : 'null',
+  });
+
+  // Проверяем наличие видео треков перед установкой
+  if (videoTracks.length === 0) {
+    console.log(`[VideoGrid] Нет видео треков для ${peerId}, очищаем элемент`);
+    if (videoElement.srcObject) {
+      videoElement.srcObject = null;
+    }
+    return;
+  }
+
+  // Проверяем, не установлен ли уже этот поток
+  if (videoElement.srcObject !== remoteStream.stream) {
+    console.log(`[VideoGrid] Устанавливаем новый поток для ${peerId}`);
+    videoElement.srcObject = remoteStream.stream;
+    
+    // Функция для попытки воспроизведения с retry
+    const tryPlay = async (retries = 5): Promise<void> => {
+      try {
+        await videoElement.play();
+        console.log(`[VideoGrid] ✅ Видео от ${peerId} успешно запущено!`);
+        console.log(`[VideoGrid] Состояние видео элемента для ${peerId}:`, {
+          paused: videoElement.paused,
+          muted: videoElement.muted,
+          readyState: videoElement.readyState,
+          videoWidth: videoElement.videoWidth,
+          videoHeight: videoElement.videoHeight,
+        });
+      } catch (err: any) {
+        console.error(
+          `[VideoGrid] Ошибка воспроизведения видео от ${peerId} (попытка ${6 - retries}/5):`,
+          {
+            name: err.name,
+            message: err.message,
+            paused: videoElement.paused,
+            readyState: videoElement.readyState,
+          }
+        );
+
+        if (retries > 0 && err.name !== "NotAllowedError") {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          return tryPlay(retries - 1);
+        } else {
+          console.error(
+            `[VideoGrid] ❌ Не удалось запустить видео от ${peerId} после всех попыток`
+          );
+        }
+      }
+    };
+
+    await tryPlay();
+  } else if (videoElement.paused) {
+    // Если поток уже установлен, но видео приостановлено, возобновляем
+    console.log(`[VideoGrid] Возобновляем воспроизведение для ${peerId}`);
+    videoElement.play().catch((err) => {
+      console.error(
+        `[VideoGrid] Ошибка возобновления видео от ${peerId}:`,
+        err
+      );
+    });
+  } else {
+    console.log(`[VideoGrid] Видео от ${peerId} уже воспроизводится`);
+  }
+};
+
+// Привязка удаленных потоков к видео элементам
+// Используем watch на props.remoteStreams для отслеживания изменений Map
 watch(
   () => props.remoteStreams,
   async (streams) => {
@@ -453,32 +560,28 @@ watch(
       console.warn("[VideoGrid] remoteStreams не является Map или undefined");
       return;
     }
-    streams.forEach((remoteStream, peerId) => {
-      const videoElement = remoteVideoRefs.value.get(peerId);
-      if (videoElement && remoteStream.stream) {
-        const videoTracks = remoteStream.stream.getVideoTracks();
-        if (videoTracks.length > 0) {
-          // Проверяем, не установлен ли уже этот поток
-          if (videoElement.srcObject !== remoteStream.stream) {
-            videoElement.srcObject = remoteStream.stream;
-            videoElement.play().catch((err) => {
-              console.error(
-                `[VideoGrid] Ошибка воспроизведения видео от ${peerId}:`,
-                err
-              );
-            });
-          } else if (videoElement.paused) {
-            // Если поток уже установлен, но видео приостановлено, возобновляем
-            videoElement.play().catch((err) => {
-              console.error(
-                `[VideoGrid] Ошибка возобновления видео от ${peerId}:`,
-                err
-              );
-            });
-          }
-        }
-      }
-    });
+    
+    console.log(`[VideoGrid] Обновление удаленных потоков, количество: ${streams.size}`);
+    
+    // Обрабатываем каждый поток
+    for (const [peerId, remoteStream] of streams.entries()) {
+      await setRemoteStream(peerId, remoteStream);
+    }
+  },
+  { deep: true, immediate: true }
+);
+
+// Дополнительный watch на remoteStreamsArray для более надежного отслеживания изменений
+watch(
+  remoteStreamsArray,
+  async (streamsArray) => {
+    await nextTick();
+    console.log(`[VideoGrid] Обновление через remoteStreamsArray, количество: ${streamsArray.length}`);
+    
+    // Обрабатываем каждый поток
+    for (const { peerId, stream } of streamsArray) {
+      await setRemoteStream(peerId, stream);
+    }
   },
   { deep: true, immediate: true }
 );
@@ -495,21 +598,10 @@ onMounted(async () => {
 
   // Также привязываем удаленные потоки
   if (props.remoteStreams && props.remoteStreams instanceof Map) {
-    props.remoteStreams.forEach((remoteStream, peerId) => {
-      const videoElement = remoteVideoRefs.value.get(peerId);
-      if (videoElement && remoteStream.stream) {
-        const videoTracks = remoteStream.stream.getVideoTracks();
-        if (videoTracks.length > 0) {
-          videoElement.srcObject = remoteStream.stream;
-          videoElement.play().catch((err) => {
-            console.error(
-              `[VideoGrid] Ошибка воспроизведения видео от ${peerId} в onMounted:`,
-              err
-            );
-          });
-        }
-      }
-    });
+    console.log(`[VideoGrid] onMounted: устанавливаем ${props.remoteStreams.size} удаленных потоков`);
+    for (const [peerId, remoteStream] of props.remoteStreams.entries()) {
+      await setRemoteStream(peerId, remoteStream);
+    }
   }
 });
 

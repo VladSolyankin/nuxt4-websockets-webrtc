@@ -313,77 +313,133 @@ export const useWebRTC = (
     }
 
     // Обработка получения удаленных треков
+    // Согласно примерам Google WebRTC: https://github.com/webrtc/samples/blob/gh-pages/src/content/peerconnection/pc1/js/main.js
     peerConnection.ontrack = (event) => {
-      console.log("[WebRTC] Получен удаленный трек от", targetPeerId);
-      const stream = event.streams[0];
-      if (stream) {
-        // Проверяем реальное состояние треков
-        const audioTracks = stream.getAudioTracks();
-        const videoTracks = stream.getVideoTracks();
-        const audioEnabled =
-          audioTracks.length > 0 && audioTracks.some((t) => t.enabled);
-        const videoEnabled =
-          videoTracks.length > 0 && videoTracks.some((t) => t.enabled);
+      console.log("[WebRTC] Получен удаленный трек от", targetPeerId, {
+        track: event.track,
+        trackKind: event.track.kind,
+        streams: event.streams.length,
+        trackId: event.track.id,
+      });
 
-        const remoteStream: RemoteStream = {
+      // Получаем поток из события или создаем новый, если потока нет
+      // В некоторых случаях event.streams может быть пустым, поэтому создаем поток из трека
+      let stream = event.streams[0];
+
+      if (!stream) {
+        // Если потока нет в событии, создаем новый поток из трека
+        console.log(
+          "[WebRTC] Поток отсутствует в событии, создаем новый из трека"
+        );
+        stream = new MediaStream([event.track]);
+      }
+
+      // Проверяем, существует ли уже удаленный поток для этого участника
+      let remoteStream = remoteStreams.value.get(targetPeerId);
+
+      if (!remoteStream) {
+        // Создаем новый RemoteStream если его еще нет
+        remoteStream = {
           peerId: targetPeerId,
-          stream,
-          audioEnabled,
-          videoEnabled,
+          stream: new MediaStream(),
+          audioEnabled: false,
+          videoEnabled: false,
         };
         remoteStreams.value.set(targetPeerId, remoteStream);
-
-        // Отслеживаем изменения состояния треков
-        audioTracks.forEach((track) => {
-          track.onended = () => {
-            const rs = remoteStreams.value.get(targetPeerId);
-            if (rs) {
-              rs.audioEnabled = false;
-            }
-          };
-          track.onmute = () => {
-            const rs = remoteStreams.value.get(targetPeerId);
-            if (rs) {
-              rs.audioEnabled = false;
-            }
-          };
-          track.onunmute = () => {
-            const rs = remoteStreams.value.get(targetPeerId);
-            if (rs) {
-              rs.audioEnabled = true;
-            }
-          };
-        });
-
-        videoTracks.forEach((track) => {
-          track.onended = () => {
-            const rs = remoteStreams.value.get(targetPeerId);
-            if (rs) {
-              rs.videoEnabled = false;
-            }
-          };
-          track.onmute = () => {
-            const rs = remoteStreams.value.get(targetPeerId);
-            if (rs) {
-              rs.videoEnabled = false;
-            }
-          };
-          track.onunmute = () => {
-            const rs = remoteStreams.value.get(targetPeerId);
-            if (rs) {
-              rs.videoEnabled = true;
-            }
-          };
-        });
-
-        console.log("[WebRTC] Удаленный поток добавлен:", {
-          peerId: targetPeerId,
-          audioTracks: audioTracks.length,
-          videoTracks: videoTracks.length,
-          audioEnabled,
-          videoEnabled,
-        });
+        console.log("[WebRTC] Создан новый RemoteStream для", targetPeerId);
       }
+
+      // Добавляем трек в поток (если его там еще нет)
+      const existingTrack = remoteStream.stream
+        .getTracks()
+        .find((t) => t.id === event.track.id);
+
+      if (!existingTrack) {
+        remoteStream.stream.addTrack(event.track);
+        console.log("[WebRTC] Трек добавлен в поток:", {
+          trackId: event.track.id,
+          trackKind: event.track.kind,
+          enabled: event.track.enabled,
+        });
+      } else {
+        console.log(
+          "[WebRTC] Трек уже существует в потоке, пропускаем:",
+          event.track.id
+        );
+        return;
+      }
+
+      // Обновляем состояние треков после добавления
+      const audioTracks = remoteStream.stream.getAudioTracks();
+      const videoTracks = remoteStream.stream.getVideoTracks();
+      remoteStream.audioEnabled =
+        audioTracks.length > 0 && audioTracks.some((t) => t.enabled);
+      remoteStream.videoEnabled =
+        videoTracks.length > 0 && videoTracks.some((t) => t.enabled);
+
+      // Отслеживаем изменения состояния треков
+      event.track.onended = () => {
+        console.log(
+          "[WebRTC] Трек завершен:",
+          event.track.id,
+          event.track.kind
+        );
+        const rs = remoteStreams.value.get(targetPeerId);
+        if (rs) {
+          if (event.track.kind === "audio") {
+            rs.audioEnabled = false;
+          } else if (event.track.kind === "video") {
+            rs.videoEnabled = false;
+          }
+          // Триггерим реактивность Vue, создавая новую Map
+          remoteStreams.value = new Map(remoteStreams.value);
+        }
+      };
+
+      event.track.onmute = () => {
+        console.log(
+          "[WebRTC] Трек приглушен:",
+          event.track.id,
+          event.track.kind
+        );
+        const rs = remoteStreams.value.get(targetPeerId);
+        if (rs) {
+          if (event.track.kind === "audio") {
+            rs.audioEnabled = false;
+          } else if (event.track.kind === "video") {
+            rs.videoEnabled = false;
+          }
+          // Триггерим реактивность Vue
+          remoteStreams.value = new Map(remoteStreams.value);
+        }
+      };
+
+      event.track.onunmute = () => {
+        console.log("[WebRTC] Трек включен:", event.track.id, event.track.kind);
+        const rs = remoteStreams.value.get(targetPeerId);
+        if (rs) {
+          if (event.track.kind === "audio") {
+            rs.audioEnabled = true;
+          } else if (event.track.kind === "video") {
+            rs.videoEnabled = true;
+          }
+          // Триггерим реактивность Vue
+          remoteStreams.value = new Map(remoteStreams.value);
+        }
+      };
+
+      // Триггерим реактивность Vue после обновления
+      remoteStreams.value = new Map(remoteStreams.value);
+
+      console.log("[WebRTC] ✅ Удаленный поток обновлен:", {
+        peerId: targetPeerId,
+        audioTracks: audioTracks.length,
+        videoTracks: videoTracks.length,
+        totalTracks: remoteStream.stream.getTracks().length,
+        audioEnabled: remoteStream.audioEnabled,
+        videoEnabled: remoteStream.videoEnabled,
+        streamId: remoteStream.stream.id,
+      });
     };
 
     // Обработка ICE кандидатов
@@ -395,7 +451,17 @@ export const useWebRTC = (
           sdpMid: event.candidate.sdpMid,
           usernameFragment: event.candidate.usernameFragment || null,
         };
+        console.log(`[WebRTC] Отправка ICE candidate для ${targetPeerId}:`, {
+          candidate: candidate.candidate?.substring(0, 50) + "...",
+          sdpMLineIndex: candidate.sdpMLineIndex,
+          sdpMid: candidate.sdpMid,
+        });
         sendIceCandidate(candidate, targetPeerId, roomId);
+      } else {
+        // null кандидат означает завершение ICE gathering
+        console.log(
+          `[WebRTC] ICE candidate gathering завершен для ${targetPeerId}`
+        );
       }
     };
 
@@ -415,6 +481,100 @@ export const useWebRTC = (
 
     connections.value.set(targetPeerId, peerConnection);
     return peerConnection;
+  };
+
+  // Вспомогательная функция для обработки отложенных ICE кандидатов
+  const processPendingIceCandidates = async (
+    peerConnection: RTCPeerConnection,
+    peerId: string
+  ) => {
+    const pendingCandidates = pendingIceCandidates.value.get(peerId);
+    if (!pendingCandidates || pendingCandidates.length === 0) {
+      return;
+    }
+
+    console.log(
+      `[WebRTC] Обрабатываем ${pendingCandidates.length} отложенных ICE кандидатов для ${peerId}`
+    );
+
+    const currentState = peerConnection.signalingState;
+    const hasRemoteDescription = !!peerConnection.remoteDescription;
+
+    // Обрабатываем кандидаты только если соединение готово
+    if (
+      currentState === "have-remote-offer" ||
+      currentState === "have-local-pranswer" ||
+      currentState === "have-remote-pranswer" ||
+      currentState === "stable" ||
+      (currentState === "have-local-offer" && hasRemoteDescription)
+    ) {
+      for (const candidate of pendingCandidates) {
+        try {
+          // Валидация кандидата
+          if (!candidate.candidate || candidate.candidate.trim() === "") {
+            continue; // Пропускаем пустые кандидаты
+          }
+
+          const iceCandidateInit: RTCIceCandidateInit = {};
+
+          if (candidate.candidate) {
+            iceCandidateInit.candidate = candidate.candidate;
+          }
+
+          if (
+            candidate.sdpMLineIndex !== null &&
+            candidate.sdpMLineIndex !== undefined
+          ) {
+            iceCandidateInit.sdpMLineIndex = candidate.sdpMLineIndex;
+          }
+
+          if (candidate.sdpMid) {
+            iceCandidateInit.sdpMid = candidate.sdpMid;
+          }
+
+          if (candidate.usernameFragment) {
+            iceCandidateInit.usernameFragment = candidate.usernameFragment;
+          }
+
+          // Проверяем, что у нас есть хотя бы candidate или sdpMid
+          if (!iceCandidateInit.candidate && !iceCandidateInit.sdpMid) {
+            console.warn(
+              `[WebRTC] Некорректный отложенный ICE candidate от ${peerId}: нет candidate и sdpMid`
+            );
+            continue;
+          }
+
+          await peerConnection.addIceCandidate(
+            new RTCIceCandidate(iceCandidateInit)
+          );
+          console.log(
+            `[WebRTC] ✅ Отложенный ICE candidate успешно добавлен для ${peerId}`
+          );
+        } catch (candidateError: any) {
+          const errorName = candidateError?.name || "Unknown";
+          // OperationError и InvalidStateError не критичны
+          if (
+            errorName === "OperationError" ||
+            errorName === "InvalidStateError"
+          ) {
+            console.warn(
+              `[WebRTC] ⚠️ Не удалось добавить отложенный ICE candidate от ${peerId}:`,
+              errorName
+            );
+          } else {
+            console.error(
+              `[WebRTC] ❌ Ошибка добавления отложенного ICE candidate от ${peerId}:`,
+              candidateError
+            );
+          }
+        }
+      }
+      pendingIceCandidates.value.delete(peerId);
+    } else {
+      console.log(
+        `[WebRTC] Соединение с ${peerId} еще не готово для обработки отложенных кандидатов (${currentState})`
+      );
+    }
   };
 
   // Инициализация соединения (создание offer)
@@ -485,30 +645,7 @@ export const useWebRTC = (
       console.log(`[WebRTC] Answer создан и отправлен для ${senderPeerId}`);
 
       // Обрабатываем отложенные ICE кандидаты после установки local description
-      const pendingCandidates = pendingIceCandidates.value.get(senderPeerId);
-      if (pendingCandidates && pendingCandidates.length > 0) {
-        console.log(
-          `[WebRTC] Обрабатываем ${pendingCandidates.length} отложенных ICE кандидатов для ${senderPeerId}`
-        );
-        for (const candidate of pendingCandidates) {
-          try {
-            await peerConnection.addIceCandidate(
-              new RTCIceCandidate({
-                candidate: candidate.candidate,
-                sdpMLineIndex: candidate.sdpMLineIndex,
-                sdpMid: candidate.sdpMid,
-                usernameFragment: candidate.usernameFragment || undefined,
-              })
-            );
-          } catch (candidateError) {
-            console.warn(
-              `[WebRTC] Ошибка добавления отложенного ICE кандидата:`,
-              candidateError
-            );
-          }
-        }
-        pendingIceCandidates.value.delete(senderPeerId);
-      }
+      await processPendingIceCandidates(peerConnection, senderPeerId);
     } catch (error) {
       console.error(
         `[WebRTC] Ошибка обработки offer от ${senderPeerId}:`,
@@ -548,30 +685,7 @@ export const useWebRTC = (
         console.log(`[WebRTC] Answer успешно установлен для ${senderPeerId}`);
 
         // Обрабатываем отложенные ICE кандидаты
-        const pendingCandidates = pendingIceCandidates.value.get(senderPeerId);
-        if (pendingCandidates && pendingCandidates.length > 0) {
-          console.log(
-            `[WebRTC] Обрабатываем ${pendingCandidates.length} отложенных ICE кандидатов для ${senderPeerId}`
-          );
-          for (const candidate of pendingCandidates) {
-            try {
-              await peerConnection.addIceCandidate(
-                new RTCIceCandidate({
-                  candidate: candidate.candidate,
-                  sdpMLineIndex: candidate.sdpMLineIndex,
-                  sdpMid: candidate.sdpMid,
-                  usernameFragment: candidate.usernameFragment || undefined,
-                })
-              );
-            } catch (candidateError) {
-              console.warn(
-                `[WebRTC] Ошибка добавления отложенного ICE кандидата:`,
-                candidateError
-              );
-            }
-          }
-          pendingIceCandidates.value.delete(senderPeerId);
-        }
+        await processPendingIceCandidates(peerConnection, senderPeerId);
       } else if (currentState === "stable") {
         // Если соединение уже в stable, значит answer уже был установлен
         // Это может быть нормально, если answer пришел дважды
@@ -593,6 +707,7 @@ export const useWebRTC = (
   };
 
   // Обработка полученного ICE кандидата
+  // Согласно примерам Google WebRTC: https://github.com/webrtc/samples/blob/gh-pages/src/content/peerconnection/pc1/js/main.js
   const handleIceCandidate = async (
     candidate: WebRTCIceCandidate,
     senderPeerId: string
@@ -614,41 +729,112 @@ export const useWebRTC = (
     try {
       // Проверяем состояние соединения
       const currentState = peerConnection.signalingState;
+      const hasRemoteDescription = !!peerConnection.remoteDescription;
+
+      // Валидация кандидата
+      if (!candidate.candidate || candidate.candidate.trim() === "") {
+        console.log(
+          `[WebRTC] Пустой ICE candidate от ${senderPeerId}, это нормально (завершение ICE gathering)`
+        );
+        // Пустой кандидат означает завершение ICE gathering - это нормально
+        return;
+      }
 
       // ICE кандидаты можно добавлять только если remote description установлен
-      // или если мы в процессе установки (не в "stable" без remote description)
+      // Согласно спецификации WebRTC, кандидаты можно добавлять в состояниях:
+      // - "have-remote-offer" (после установки remote offer)
+      // - "have-local-pranswer" (после установки remote offer и local pranswer)
+      // - "have-remote-pranswer" (после установки local offer и remote pranswer)
+      // - "stable" (после установки обоих descriptions)
       if (
-        currentState === "have-local-offer" ||
         currentState === "have-remote-offer" ||
-        currentState === "stable"
+        currentState === "have-local-pranswer" ||
+        currentState === "have-remote-pranswer" ||
+        currentState === "stable" ||
+        (currentState === "have-local-offer" && hasRemoteDescription)
       ) {
+        // Создаем объект кандидата с валидацией
+        const iceCandidateInit: RTCIceCandidateInit = {};
+
+        if (candidate.candidate) {
+          iceCandidateInit.candidate = candidate.candidate;
+        }
+
+        if (
+          candidate.sdpMLineIndex !== null &&
+          candidate.sdpMLineIndex !== undefined
+        ) {
+          iceCandidateInit.sdpMLineIndex = candidate.sdpMLineIndex;
+        }
+
+        if (candidate.sdpMid) {
+          iceCandidateInit.sdpMid = candidate.sdpMid;
+        }
+
+        if (candidate.usernameFragment) {
+          iceCandidateInit.usernameFragment = candidate.usernameFragment;
+        }
+
+        // Проверяем, что у нас есть хотя бы candidate или sdpMid
+        if (!iceCandidateInit.candidate && !iceCandidateInit.sdpMid) {
+          console.warn(
+            `[WebRTC] Некорректный ICE candidate от ${senderPeerId}: нет candidate и sdpMid`
+          );
+          return;
+        }
+
         await peerConnection.addIceCandidate(
-          new RTCIceCandidate({
-            candidate: candidate.candidate,
-            sdpMLineIndex: candidate.sdpMLineIndex,
-            sdpMid: candidate.sdpMid,
-            usernameFragment: candidate.usernameFragment || undefined,
-          })
+          new RTCIceCandidate(iceCandidateInit)
         );
         console.log(
-          `[WebRTC] ICE candidate успешно добавлен для ${senderPeerId}`
+          `[WebRTC] ✅ ICE candidate успешно добавлен для ${senderPeerId}`,
+          {
+            candidate: candidate.candidate?.substring(0, 50) + "...",
+            sdpMLineIndex: candidate.sdpMLineIndex,
+            sdpMid: candidate.sdpMid,
+            state: currentState,
+          }
         );
       } else {
         // Сохраняем в буфер, если соединение еще не готово
         console.log(
-          `[WebRTC] Соединение с ${senderPeerId} не готово (${currentState}), сохраняем ICE candidate в буфер`
+          `[WebRTC] Соединение с ${senderPeerId} не готово (${currentState}, hasRemoteDescription: ${hasRemoteDescription}), сохраняем ICE candidate в буфер`
         );
         if (!pendingIceCandidates.value.has(senderPeerId)) {
           pendingIceCandidates.value.set(senderPeerId, []);
         }
         pendingIceCandidates.value.get(senderPeerId)!.push(candidate);
       }
-    } catch (error) {
-      console.error(
-        `[WebRTC] Ошибка добавления ICE candidate от ${senderPeerId}:`,
-        error
-      );
-      // Не критично, продолжаем работу
+    } catch (error: any) {
+      // Некоторые ошибки ICE кандидатов не критичны и могут быть проигнорированы
+      const errorName = error?.name || "Unknown";
+      const errorMessage = error?.message || String(error);
+
+      // OperationError обычно означает, что кандидат уже был добавлен или невалиден
+      // Это не критично, так как браузер может автоматически фильтровать дубликаты
+      if (errorName === "OperationError" || errorName === "InvalidStateError") {
+        console.warn(
+          `[WebRTC] ⚠️ Не удалось добавить ICE candidate от ${senderPeerId}:`,
+          {
+            error: errorName,
+            message: errorMessage,
+            candidate: candidate.candidate?.substring(0, 50) + "...",
+            state: peerConnection?.signalingState,
+          }
+        );
+        // Не критично, продолжаем работу
+      } else {
+        console.error(
+          `[WebRTC] ❌ Ошибка добавления ICE candidate от ${senderPeerId}:`,
+          {
+            error: errorName,
+            message: errorMessage,
+            candidate: candidate.candidate?.substring(0, 50) + "...",
+            state: peerConnection?.signalingState,
+            stack: error?.stack,
+          }
+        );
+      }
     }
   };
 
@@ -736,6 +922,12 @@ export const useWebRTC = (
     if (remoteStream) {
       remoteStream.audioEnabled = audioEnabled;
       remoteStream.videoEnabled = videoEnabled;
+      // Триггерим реактивность Vue
+      remoteStreams.value = new Map(remoteStreams.value);
+      console.log("[WebRTC] Состояние медиа обновлено для", peerId, {
+        audioEnabled,
+        videoEnabled,
+      });
     }
   };
 
